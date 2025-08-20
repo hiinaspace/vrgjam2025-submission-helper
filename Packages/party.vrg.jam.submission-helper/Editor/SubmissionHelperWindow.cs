@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -14,6 +15,9 @@ namespace Party.Vrg.Jam
         private List<ValidationResult> validationResults = new List<ValidationResult>();
         private bool tosAccepted = false;
         private string statusMessage = "";
+        private bool isUploading = false;
+        private float uploadProgress = 0f;
+        private Coroutine uploadCoroutine = null;
 
         private List<GameJamPackage> detectedPackages = new List<GameJamPackage>();
         private int selectedPackageIndex = -1;
@@ -334,7 +338,7 @@ namespace Party.Vrg.Jam
 
         private void DrawExportSection()
         {
-            EditorGUILayout.LabelField("Export Package", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("Submit Package", EditorStyles.boldLabel);
 
             // Show ZIP naming preview
             if (selectedPackage != null)
@@ -351,22 +355,161 @@ namespace Party.Vrg.Jam
                 );
             }
 
-            GUI.enabled = tosAccepted && selectedPackage != null;
-            if (GUILayout.Button("Export as ZIP"))
+            // Upload progress bar
+            if (isUploading)
             {
-                ExportPackageAsZip();
+                EditorGUILayout.Space();
+                EditorGUI.ProgressBar(
+                    EditorGUILayout.GetControlRect(),
+                    uploadProgress,
+                    $"Uploading... {(uploadProgress * 100):F0}%"
+                );
+                EditorGUILayout.Space();
+            }
+
+            // Primary action: Submit to Server
+            GUI.enabled = tosAccepted && selectedPackage != null && !isUploading;
+            if (GUILayout.Button("Submit to Server", GUILayout.Height(30)))
+            {
+                SubmitPackageToServer();
             }
             GUI.enabled = true;
 
             EditorGUILayout.Space();
 
-            // Server submission (disabled for now)
-            GUI.enabled = false;
-            if (GUILayout.Button("Submit to Server (Coming Soon)"))
+            // Secondary action: Export ZIP locally (backup option)
+            GUI.enabled = tosAccepted && selectedPackage != null && !isUploading;
+            if (GUILayout.Button("Export ZIP Locally (Backup)"))
             {
-                // TODO: Server submission
+                ExportPackageAsZip();
             }
             GUI.enabled = true;
+
+            // Help text for backup option
+            EditorGUILayout.LabelField(
+                "Use backup export if server submission fails - you'll need to send the ZIP to jam organizers manually",
+                EditorStyles.wordWrappedMiniLabel
+            );
+        }
+
+        private void SubmitPackageToServer()
+        {
+            if (selectedPackage == null || isUploading)
+                return;
+
+            Debug.Log("[SubmissionHelper] Starting package submission to server");
+
+            // Create a GameObject to run the coroutine (will be destroyed after completion)
+            var go = new GameObject("UploadCoroutineRunner");
+            go.hideFlags = HideFlags.HideAndDontSave;
+            var runner = go.AddComponent<CoroutineRunner>();
+            runner.StartUpload(this);
+        }
+
+        public IEnumerator SubmitPackageCoroutine()
+        {
+            Debug.Log("[SubmissionHelper] SubmitPackageCoroutine started");
+            isUploading = true;
+            uploadProgress = 0f;
+            statusMessage = "Preparing upload...";
+
+            // Generate ZIP filename
+            var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            var zipName = $"{selectedPackage.name}-v{selectedPackage.version}-{timestamp}.zip";
+            Debug.Log($"[SubmissionHelper] Generated ZIP name: {zipName}");
+
+            byte[] zipData = null;
+            try
+            {
+                Debug.Log("[SubmissionHelper] Creating ZIP data in memory...");
+                // Create ZIP data in memory
+                zipData = CreatePackageZipInMemory(selectedPackage);
+                Debug.Log(
+                    $"[SubmissionHelper] ZIP created successfully, size: {zipData.Length} bytes"
+                );
+            }
+            catch (Exception ex)
+            {
+                statusMessage = $"Upload preparation failed: {ex.Message}";
+                EditorUtility.DisplayDialog(
+                    "Upload Error",
+                    $"Failed to prepare upload:\\n{ex.Message}\\n\\nPlease try 'Export ZIP Locally' instead.",
+                    "OK"
+                );
+                Debug.LogError($"Upload preparation failed: {ex}");
+
+                isUploading = false;
+                uploadProgress = 0f;
+                uploadCoroutine = null;
+                Repaint();
+                yield break;
+            }
+
+            statusMessage = "Starting upload...";
+            Repaint();
+
+            bool uploadComplete = false;
+            string uploadError = null;
+
+            Debug.Log("[SubmissionHelper] About to start TusUploadClient.UploadFile...");
+            // Start upload (yield return outside try-catch)
+            yield return TusUploadClient.UploadFile(
+                zipData,
+                zipName,
+                progress =>
+                {
+                    uploadProgress = progress;
+                    statusMessage = $"Uploading... {(progress * 100):F0}%";
+                    Repaint();
+                },
+                uploadUrl =>
+                {
+                    uploadComplete = true;
+                    statusMessage = "Upload completed successfully!";
+                    Debug.Log($"Package uploaded successfully to: {uploadUrl}");
+                },
+                error =>
+                {
+                    uploadError = error;
+                    statusMessage = $"Upload failed: {error}";
+                }
+            );
+
+            // Handle upload result
+            if (uploadComplete)
+            {
+                EditorUtility.DisplayDialog(
+                    "Upload Complete",
+                    $"Your package '{selectedPackage.displayName}' has been successfully submitted to the /vrg/ Game Jam 2025!\n\nThank you for your submission.",
+                    "OK"
+                );
+            }
+            else if (!string.IsNullOrEmpty(uploadError))
+            {
+                EditorUtility.DisplayDialog(
+                    "Upload Failed",
+                    $"Failed to upload package:\n{uploadError}\n\nPlease try again or use 'Export ZIP Locally' as a backup.",
+                    "OK"
+                );
+            }
+
+            // Cleanup
+            isUploading = false;
+            uploadProgress = 0f;
+            uploadCoroutine = null;
+            Repaint();
+        }
+
+        private byte[] CreatePackageZipInMemory(GameJamPackage package)
+        {
+            using (var memoryStream = new MemoryStream())
+            {
+                using (var archive = new ZipArchive(memoryStream, ZipArchiveMode.Create, true))
+                {
+                    AddDirectoryToZip(archive, package.packagePath, package.name);
+                }
+                return memoryStream.ToArray();
+            }
         }
 
         private void ExportPackageAsZip()
@@ -476,6 +619,30 @@ namespace Party.Vrg.Jam
             if (!string.IsNullOrEmpty(statusMessage))
             {
                 EditorGUILayout.LabelField("Status: " + statusMessage, EditorStyles.miniLabel);
+            }
+        }
+    }
+
+    // Helper class to run coroutines in editor
+    public class CoroutineRunner : MonoBehaviour
+    {
+        public void StartUpload(SubmissionHelperWindow window)
+        {
+            StartCoroutine(RunUpload(window));
+        }
+
+        private IEnumerator RunUpload(SubmissionHelperWindow window)
+        {
+            yield return window.SubmitPackageCoroutine();
+
+            // Clean up after completion
+            if (Application.isPlaying)
+            {
+                Destroy(gameObject);
+            }
+            else
+            {
+                DestroyImmediate(gameObject);
             }
         }
     }
