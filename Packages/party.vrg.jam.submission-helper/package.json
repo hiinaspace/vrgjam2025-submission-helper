@@ -1,7 +1,7 @@
 {
   "name": "party.vrg.jam.submission-helper",
   "displayName": "/vrg/ Game Jam 2025 Submission Helper",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "unity": "2022.3",
   "description": "Editor window for /vrg/ Game Jam 2025 submission process, like VRChat SDK's Build tool, or VKet's.",
   "vrchatVersion": "2022.1.1",
